@@ -73,6 +73,8 @@ int bad_circuit_id = 0;		/* Circuit ID option in matching RAI option
 				   did not match any known circuit ID. */
 int missing_circuit_id = 0;	/* Circuit ID option in matching RAI option
 				   was missing. */
+const char *agent_circuit_id_fmt = NULL; /* Circuit ID custom format string. */
+const char *agent_remote_id_fmt = NULL; /* Remote ID custom format string. */
 int max_hop_count = 10;		/* Maximum hop count */
 
 #ifdef DHCPv6
@@ -140,9 +142,18 @@ static const char message[] =
 static const char url[] =
 "For info, please visit https://www.isc.org/software/dhcp/";
 
+#define DHCRELAY_OPTION82_USAGE \
+"circuit_id/remote_id interpreted sequences are:\n" \
+"\n" \
+"  %%%%  a single %%\n" \
+"  %%i  Its name of interfaceN that received the request\n" \
+"  %%h  interfaceN hardware address\n" \
+"  %%H  Client hardware address\n" \
+"  %%I  DHCP relay agent IP Address\n" \
+
 #ifdef DHCPv6
 #define DHCRELAY_USAGE \
-"Usage: dhcrelay [-4] [-d] [-q] [-a] [-D]\n"\
+"Usage: dhcrelay [-4] [-d] [-q] [-a <circuit_id> <remote_id>] [-D]\n"\
 "                     [-A <length>] [-c <hops>] [-p <port>]\n" \
 "                     [-pf <pid-file>] [--no-pid]\n"\
 "                     [-m append|replace|forward|discard]\n" \
@@ -154,14 +165,15 @@ static const char url[] =
 "                     -l lower0 [ ... -l lowerN]\n" \
 "                     -u upper0 [ ... -u upperN]\n" \
 "       lower (client link): [address%%]interface[#index]\n" \
-"       upper (server link): [address%%]interface"
+"       upper (server link): [address%%]interface\n\n" DHCRELAY_OPTION82_USAGE
 #else
 #define DHCRELAY_USAGE \
-"Usage: dhcrelay [-d] [-q] [-a] [-D] [-A <length>] [-c <hops>] [-p <port>]\n" \
-"                [-pf <pid-file>] [--no-pid]\n" \
+"Usage: dhcrelay [-d] [-q] [-a <circuit_id> <remote_id>] [-D]\n" \
+"                [-A <length>] [-c <hops>] [-p <port>]\n" \
+"                [-pf <pid-file>] [--no-pid]\n"\
 "                [-m append|replace|forward|discard]\n" \
 "                [-i interface0 [ ... -i interfaceN]\n" \
-"                server0 [ ... serverN]\n\n"
+"                server0 [ ... serverN]\n\n" DHCRELAY_OPTION82_USAGE
 #endif
 
 static void usage() {
@@ -287,6 +299,15 @@ main(int argc, char **argv) {
 			local_family_set = 1;
 			local_family = AF_INET;
 #endif
+			if (++i == argc)
+				usage();
+
+			if (argv[i] != NULL && argv[i][0] != '-')
+				agent_circuit_id_fmt = argv[i++];
+
+			if (argv[i] != NULL && argv[i][0] != '-')
+				agent_remote_id_fmt = argv[i];
+
 			add_agent_options = 1;
 		} else if (!strcmp(argv[i], "-A")) {
 #ifdef DHCPv6
@@ -938,6 +959,69 @@ find_interface_by_agent_option(struct dhcp_packet *packet,
 }
 
 /*
+ * Format the message that will be used by circuit_id and remote_id
+ */
+static int
+format_relay_agent_rfc3046_msg(struct interface_info *ip, struct dhcp_packet *packet,
+				const char *format, char *msg, size_t msgn) {
+    size_t len = 0;
+    char *buf = msg;
+
+    for ( ; format && *format && len < msgn; ++format) {
+	size_t strn = 0;
+	const char *str = NULL;
+
+	if (*format == '%') {
+	    switch (*++format) {
+		case '\0':
+			--format;
+		break;
+
+		case '%':  /* a literal % */
+		    str = "%";
+		break;
+
+		case 'i':  /* Its name of interfaceN that received the request */
+		    str = ip->name;
+		break;
+
+		case 'h': /* Its physical address of interfaceN */
+		    str = print_hw_addr(ip->hw_address.hbuf[0], ip->hw_address.hlen - 1, &ip->hw_address.hbuf[1]);
+		break;
+
+		case 'H': /* 24: Client hardware address  */
+		    str = print_hw_addr(packet->htype, packet->hlen, packet->chaddr);
+		break;
+
+		case 'I': /* 20: DHCP relay agent IP address */
+		    str = inet_ntoa(packet->giaddr);
+		break;
+
+		default:
+		    log_error("oops! the option %%%c will not be formatted!", *format);
+		    continue;
+	    }
+
+	    if (str)
+            strn = strlen(str);
+	} else {
+	    str = format;
+	    strn += 1;
+	}
+
+	// have room?
+	if ((strn+len) > msgn) {
+	    return 0;
+	}
+
+	memcpy(buf+len, str, strn);
+	len += strn;
+    }
+
+    return len;
+}
+
+/*
  * Examine a packet to see if it's a candidate to have a Relay
  * Agent Information option tacked onto its tail.   If it is, tack
  * the option on.
@@ -948,6 +1032,8 @@ add_relay_agent_options(struct interface_info *ip, struct dhcp_packet *packet,
 	int is_dhcp = 0, mms;
 	unsigned optlen;
 	u_int8_t *op, *nextop, *sp, *max, *end_pad = NULL;
+	char circuit_id_buf[255] = { '\0', };
+	char remote_id_buf[255] = { '\0', };
 
 	/* If we're not adding agent options to packets, we can skip
 	   this. */
@@ -1076,6 +1162,37 @@ add_relay_agent_options(struct interface_info *ip, struct dhcp_packet *packet,
 	   it. */
 	op = sp;
 #endif
+	/* option82: custom string for circuit_id */
+	if (agent_circuit_id_fmt) {
+		size_t len = 0;
+
+		len = format_relay_agent_rfc3046_msg(ip, packet, agent_circuit_id_fmt,
+							circuit_id_buf, sizeof(circuit_id_buf));
+
+		if (len > 0) {
+			ip->circuit_id = (uint8_t *)circuit_id_buf;
+			ip->circuit_id_len = len;
+
+			log_debug("sending on %s option82:circuit_id='%s'(%d)",
+					ip->name, (char *)ip->circuit_id, ip->circuit_id_len);
+		}
+	}
+
+    /* option82: custom string for remote_id */
+    if (agent_remote_id_fmt) {
+		size_t len = 0;
+
+		len = format_relay_agent_rfc3046_msg(ip, packet, agent_remote_id_fmt,
+							remote_id_buf, sizeof(remote_id_buf));
+
+		if (len > 0) {
+			ip->remote_id = (uint8_t *)remote_id_buf;
+			ip->remote_id_len = len;
+
+			log_debug("sending on %s option82:remote_id='%s'(%d)",
+					ip->name, (char *)ip->remote_id, ip->remote_id_len);
+		}
+	}
 
 	/* Sanity check.  Had better not ever happen. */
 	if ((ip->circuit_id_len > 255) ||(ip->circuit_id_len < 1))
