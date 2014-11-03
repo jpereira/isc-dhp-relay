@@ -1,9 +1,9 @@
 isc-dhp-relay
 =============
 
-    I  have added support in dhcrelay (daemon) to be able to fill the fields
-circuit_id and remote_id (option82) with custom messages. was based on latest
-dhcp-4.3.1 from ftp://ftp.isc.org/isc/dhcp/4.3.1/dhcp-4.3.1.tar.gz
+I have added support in dhcrelay (daemon) to be able to fill the fields
+circuit_id and remote_id (option82) with custom messages. was based on
+latest dhcp-4.3.1 from ftp://ftp.isc.org/isc/dhcp/4.3.1/dhcp-4.3.1.tar.gz
 
 1. build from the original source
 
